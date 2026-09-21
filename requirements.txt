@@ -1,0 +1,14 @@
+# Shared UI and backend dependencies
+Pillow
+psutil
+
+# Raspberry Pi OLED hardware dependencies
+adafruit-blinka
+adafruit-circuitpython-ssd1306
+
+# Raspberry Pi OS packages, installed with apt rather than pip:
+# python3-gi
+# python3-gst-1.0
+# gstreamer1.0-tools
+# gstreamer1.0-libcamera
+# python3-tk
