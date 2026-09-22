@@ -68,8 +68,13 @@ def run_emulator(backend: BackendServiceInterface | None = None):
         now = time.monotonic()
         elapsed = min(now - last_time, 0.1)
         last_time = now
-        manager.update(elapsed, pressed)
-        frame = manager.render(pressed).resize((WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
+        try:
+            manager.update(elapsed, pressed)
+            frame = manager.render(pressed).resize((WIDTH * DISPLAY_SCALE, HEIGHT * DISPLAY_SCALE))
+        except Exception as error:
+            print(f"Skipping frame after error: {error}", file=sys.stderr)
+            root.after(FRAME_INTERVAL_MS, refresh)
+            return
         photo = ImageTk.PhotoImage(frame)
         canvas.delete("all")
         canvas.create_image(0, 0, anchor="nw", image=photo)

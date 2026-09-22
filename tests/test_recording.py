@@ -128,6 +128,30 @@ class RecordingTests(unittest.TestCase):
         )
 
 
+    def test_rotate_retries_start_and_does_not_raise(self):
+        """Verify rotate() rides out a transient start() failure instead of crashing."""
+        recorder = RecordFunction()
+        recorder._pipeline = None
+
+        with patch.object(recorder, "start", side_effect=[RuntimeError("busy"), None]) as start_mock, \
+                patch("backend.record.time.sleep") as sleep_mock:
+            recorder.rotate()
+
+        self.assertEqual(start_mock.call_count, 2)
+        sleep_mock.assert_called_once()
+
+    def test_rotate_gives_up_after_repeated_start_failures(self):
+        """Verify rotate() logs and returns instead of raising when start() keeps failing."""
+        recorder = RecordFunction()
+        recorder._pipeline = None
+
+        with patch.object(recorder, "start", side_effect=RuntimeError("busy")) as start_mock, \
+                patch("backend.record.time.sleep"):
+            recorder.rotate()
+
+        self.assertEqual(start_mock.call_count, 3)
+
+
 class RecordScreenTests(unittest.TestCase):
     """Unit tests for default recording and button edge handling."""
 

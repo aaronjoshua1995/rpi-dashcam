@@ -119,7 +119,7 @@ class RecordFunction:
     def rotate(self) -> None:
         """Start a fresh session while stitching the previous one in the background."""
         if self._pipeline is None:
-            self.start()
+            self._start_with_retry()
             return
 
         gst = self._load_gstreamer()
@@ -135,7 +135,20 @@ class RecordFunction:
             name="recording-stitcher",
             daemon=True,
         ).start()
-        self.start()
+        self._start_with_retry()
+
+    def _start_with_retry(self, attempts: int = 3, delay_seconds: float = 1.0) -> None:
+        """Retry starting a session to ride out the camera release delay after a rotation."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.start()
+                return
+            except RuntimeError as error:
+                if attempt == attempts:
+                    print(f"Could not start a new recording after rotation: {error}")
+                    return
+                print(f"Retrying recording start ({attempt}/{attempts}): {error}")
+                time.sleep(delay_seconds)
 
     def status(self) -> RecordingStatus:
         """Return recording status, raising when the pipeline reports an error."""

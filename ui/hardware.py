@@ -52,9 +52,12 @@ def run_hardware(backend: BackendServiceInterface | None = None):
             if pressed["R"] and not previous["R"]:
                 manager.previous()
             previous = pressed.copy()
-            manager.update(elapsed, pressed)
-            display.image(manager.render(pressed))
-            display.show()
+            try:
+                manager.update(elapsed, pressed)
+                display.image(manager.render(pressed))
+                display.show()
+            except Exception as error:
+                print(f"Skipping frame after error: {error}", file=sys.stderr)
             time.sleep(FRAME_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         print("Stopping UI...", file=sys.stderr)
