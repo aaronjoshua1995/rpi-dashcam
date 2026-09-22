@@ -9,6 +9,61 @@ import threading
 from .models import RecordingStatus
 
 
+class _EmulatedGst:
+    """Minimal GStreamer-like constants used to simulate recording without hardware."""
+
+    class Event:
+        @staticmethod
+        def new_eos():
+            return "eos"
+
+    class State:
+        NULL = "null"
+        PLAYING = "playing"
+
+    class StateChangeReturn:
+        SUCCESS = "success"
+        FAILURE = "failure"
+
+    class MessageType:
+        EOS = 1
+        ERROR = 2
+
+    SECOND = 1_000_000_000
+
+
+class _EmulatedMessage:
+    """Fake bus message standing in for a GStreamer EOS message."""
+
+    def __init__(self, message_type):
+        self.type = message_type
+
+
+class _EmulatedPipeline:
+    """No-op pipeline standing in for GStreamer when running the desktop emulator."""
+
+    def __init__(self):
+        self._state = _EmulatedGst.State.NULL
+
+    def send_event(self, _event):
+        return True
+
+    def get_bus(self):
+        return self
+
+    def timed_pop_filtered(self, _timeout, requested_types):
+        if requested_types & _EmulatedGst.MessageType.EOS:
+            return _EmulatedMessage(_EmulatedGst.MessageType.EOS)
+        return None
+
+    def set_state(self, state):
+        self._state = state
+        return _EmulatedGst.StateChangeReturn.SUCCESS
+
+    def get_state(self, _timeout):
+        return _EmulatedGst.StateChangeReturn.SUCCESS, self._state, None
+
+
 class RecordFunction:
     """Manage camera capture, fragment sessions, and stitched recordings."""
 
@@ -16,6 +71,7 @@ class RecordFunction:
     MAX_SEGMENTS = 6
     RECORDINGS_DIRECTORY = Path("/usr/share/rpi-dashcam/recordings")
     STAGING_DIRECTORY = Path("/mnt/ramdisk/rpi-dashcam-recordings")
+    EMULATOR_STAGING_DIRECTORY = Path(tempfile.gettempdir()) / "rpi-dashcam-recordings"
     WIDTH = 1920
     HEIGHT = 1080
     FRAMERATE = 30
@@ -26,13 +82,16 @@ class RecordFunction:
         self,
         recordings_directory: Path | str | None = None,
         staging_directory: Path | str | None = None,
+        emulate: bool = False,
         gst=None,
         clock=time.monotonic,
         command_runner=subprocess.run,
     ):
         """Configure storage paths and injectable dependencies for recording."""
+        default_staging = self.EMULATOR_STAGING_DIRECTORY if emulate else self.STAGING_DIRECTORY
         self.recordings_directory = Path(recordings_directory or self.RECORDINGS_DIRECTORY)
-        self.staging_directory = Path(staging_directory or self.STAGING_DIRECTORY)
+        self.staging_directory = Path(staging_directory or default_staging)
+        self._emulate = emulate
         self._gst = gst
         self._clock = clock
         self._command_runner = command_runner
@@ -56,6 +115,15 @@ class RecordFunction:
             self._staging_initialized = True
         self._session_directory = Path(tempfile.mkdtemp(prefix="session-", dir=self.staging_directory))
         recording_timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
+
+        if self._emulate:
+            pipeline = _EmulatedPipeline()
+            pipeline.set_state(gst.State.PLAYING)
+            self._pipeline = pipeline
+            self._recording_id = recording_timestamp
+            self._started_at = self._clock()
+            return
+
         location = self._session_directory / "video_%03d.mp4"
         pipeline_description = (
             "libcamerasrc name=camera ! "
@@ -218,7 +286,7 @@ class RecordFunction:
 
     def _stitch_session(self, session_directory, recording_id) -> None:
         """Stitch the five newest session fragments into a completed MP4."""
-        if session_directory is None:
+        if session_directory is None or self._emulate:
             return
 
         segments = sorted(session_directory.glob("video_*.mp4"))
@@ -289,8 +357,11 @@ class RecordFunction:
         return f"recording pipeline failed: {error}; {debug}"
 
     def _load_gstreamer(self):
-        """Load and initialize GStreamer lazily for desktop-friendly imports."""
+        """Load and initialize GStreamer lazily, or use the emulated stand-in without hardware."""
         if self._gst is None:
+            if self._emulate:
+                self._gst = _EmulatedGst
+                return self._gst
             try:
                 import gi
                 gi.require_version("Gst", "1.0")

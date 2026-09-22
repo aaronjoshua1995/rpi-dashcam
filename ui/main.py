@@ -22,7 +22,7 @@ def main():
     )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    backend = BackendService()
+    backend = BackendService(emulate=args.emulate)
     if args.emulate:
         run_emulator(backend)
     else:

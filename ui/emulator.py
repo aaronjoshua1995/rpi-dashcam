@@ -38,7 +38,7 @@ def run_emulator(backend: BackendServiceInterface | None = None):
     status.pack(pady=(0, 12))
 
     pressed = {name: False for name in BUTTON_NAMES}
-    backend = backend or BackendService()
+    backend = backend or BackendService(emulate=True)
     manager = ScreenManager(backend)
     last_time = time.monotonic()
 

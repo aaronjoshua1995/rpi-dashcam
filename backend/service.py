@@ -8,9 +8,9 @@ from .models import Recording, RecordingStatus, SystemStats
 class BackendService(BackendServiceInterface):
     """Compose the recorder, library, and system functions behind one API."""
 
-    def __init__(self):
+    def __init__(self, emulate: bool = False):
         """Create the backend services used by all screens."""
-        self.record_function = RecordFunction()
+        self.record_function = RecordFunction(emulate=emulate)
         self.system_function = SystemFunction()
         self.library_function = LibraryFunction()
 
