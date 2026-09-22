@@ -67,15 +67,15 @@ class _EmulatedPipeline:
 class RecordFunction:
     """Manage camera capture, fragment sessions, and stitched recordings."""
 
-    SEGMENT_DURATION_NS = 1 * 60 * 1_000_000_000
-    MAX_SEGMENTS = 6
+    SEGMENT_DURATION_NS = 1 * 30 * 1_000_000_000
+    MAX_SEGMENTS = 7
     RECORDINGS_DIRECTORY = Path("/usr/share/rpi-dashcam/recordings")
     STAGING_DIRECTORY = Path("/mnt/ramdisk/rpi-dashcam-recordings")
     EMULATOR_STAGING_DIRECTORY = Path(tempfile.gettempdir()) / "rpi-dashcam-recordings"
     WIDTH = 1920
     HEIGHT = 1080
     FRAMERATE = 30
-    BITRATE = 4_000_000
+    BITRATE = 8_000_000
     PIPELINE_STOP_TIMEOUT_NS = 5 * 1_000_000_000
 
     def __init__(
@@ -99,11 +99,13 @@ class RecordFunction:
         self._recording_id = None
         self._started_at = None
         self._session_directory = None
+        self._splitmuxsink = None
+        self._latest_fragment_id = None
         self._state_lock = threading.Lock()
         self._staging_initialized = False
 
     def start(self) -> None:
-        """Start a new camera session and write fragments to its temp directory."""
+        """Start the continuous camera pipeline that fragments video into its session directory."""
         if self._pipeline is not None:
             return
 
@@ -115,6 +117,7 @@ class RecordFunction:
             self._staging_initialized = True
         self._session_directory = Path(tempfile.mkdtemp(prefix="session-", dir=self.staging_directory))
         recording_timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
+        self._latest_fragment_id = None
 
         if self._emulate:
             pipeline = _EmulatedPipeline()
@@ -167,6 +170,7 @@ class RecordFunction:
             raise
 
         self._pipeline = pipeline
+        self._splitmuxsink = splitmuxsink
         self._recording_id = recording_timestamp
         self._started_at = self._clock()
 
@@ -185,25 +189,30 @@ class RecordFunction:
             self._remove_session_directory(session_directory)
 
     def rotate(self) -> None:
-        """Start a fresh session while stitching the previous one in the background."""
+        """Stitch the current clip in the background without interrupting the camera."""
         if self._pipeline is None:
             self._start_with_retry()
             return
 
-        gst = self._load_gstreamer()
         with self._state_lock:
-            pipeline, session_directory, recording_id = self._detach_recording()
-        try:
-            self._finish_pipeline(gst, pipeline)
-        except RuntimeError as error:
-            print(f"Could not finalize recording {recording_id}: {error}")
+            session_directory = self._session_directory
+            recording_id = self._recording_id
+            boundary_fragment_id = self._latest_fragment_id
+            self._recording_id = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
+            self._started_at = self._clock()
+
+        if self._splitmuxsink is not None:
+            try:
+                self._splitmuxsink.emit("split-now")
+            except Exception as error:
+                print(f"Could not force an immediate split: {error}")
+
         threading.Thread(
-            target=self._stitch_and_remove,
-            args=(session_directory, recording_id),
+            target=self._finalize_rotation,
+            args=(session_directory, recording_id, boundary_fragment_id),
             name="recording-stitcher",
             daemon=True,
         ).start()
-        self._start_with_retry()
 
     def _start_with_retry(self, attempts: int = 3, delay_seconds: float = 1.0) -> None:
         """Retry starting a session to ride out the camera release delay after a rotation."""
@@ -240,6 +249,8 @@ class RecordFunction:
         self._pipeline = None
         self._recording_id = None
         self._started_at = None
+        self._splitmuxsink = None
+        self._latest_fragment_id = None
         self._remove_session_directory()
 
     def _detach_recording(self):
@@ -251,6 +262,8 @@ class RecordFunction:
         self._recording_id = None
         self._started_at = None
         self._session_directory = None
+        self._splitmuxsink = None
+        self._latest_fragment_id = None
         return pipeline, session_directory, recording_id
 
     def _finish_pipeline(self, gst, pipeline) -> None:
@@ -271,25 +284,45 @@ class RecordFunction:
         if stop_result == gst.StateChangeReturn.FAILURE or stop_state != gst.State.NULL:
             raise RuntimeError("timed out while stopping the recording pipeline")
 
-    def _stitch_and_remove(self, session_directory, recording_id) -> None:
-        """Stitch a detached session and always remove its temporary directory."""
+    def _finalize_rotation(self, session_directory, recording_id, boundary_fragment_id) -> None:
+        """Wait for the forced split to close, then stitch every fragment through the boundary."""
+        if boundary_fragment_id is None:
+            # No fragment had opened yet when rotate() was called; nothing to stitch.
+            return
+        if not self._wait_for_fragment_closed(boundary_fragment_id):
+            print(f"Recording {recording_id} split did not complete in time; stitching what is available")
         try:
-            self._stitch_session(session_directory, recording_id)
+            self._stitch_session(
+                session_directory, recording_id, boundary_fragment_number=boundary_fragment_id + 1
+            )
         except (OSError, RuntimeError) as error:
             print(f"Could not stitch recording {recording_id}: {error}")
-        finally:
-            self._remove_session_directory(session_directory)
+
+    def _wait_for_fragment_closed(self, boundary_fragment_id: int, timeout_seconds: float = 5.0) -> bool:
+        """Poll until a fragment newer than the boundary opens, confirming it was closed."""
+        deadline = self._clock() + timeout_seconds
+        while self._clock() < deadline:
+            with self._state_lock:
+                if self._latest_fragment_id is not None and self._latest_fragment_id > boundary_fragment_id:
+                    return True
+            time.sleep(0.05)
+        return False
 
     def _format_location(self, _splitmuxsink, fragment_id: int, session_directory) -> str:
-        """Build the path for one splitmuxsink fragment in a specific session."""
+        """Build the path for one splitmuxsink fragment and record it as the newest opened."""
+        with self._state_lock:
+            self._latest_fragment_id = fragment_id
         return str(session_directory / f"video_{fragment_id + 1:03d}.mp4")
 
-    def _stitch_session(self, session_directory, recording_id) -> None:
-        """Stitch the five newest session fragments into a completed MP4."""
+    def _stitch_session(self, session_directory, recording_id, boundary_fragment_number: int | None = None) -> None:
+        """Stitch the five newest finished session fragments into a completed MP4."""
         if session_directory is None or self._emulate:
             return
 
         segments = sorted(session_directory.glob("video_*.mp4"))
+        if boundary_fragment_number is not None:
+            cutoff = session_directory / f"video_{boundary_fragment_number:03d}.mp4"
+            segments = [segment for segment in segments if segment <= cutoff]
         segments = segments[-5:]
         if not segments:
             raise RuntimeError("recording stopped without producing any segments")
@@ -306,12 +339,15 @@ class RecordFunction:
         try:
             if shutil.which("ffmpeg") is None:
                 raise RuntimeError("ffmpeg is required to stitch recording segments")
+            stitch_started_at = self._clock()
             result = self._command_runner(
                 [
                     "ffmpeg",
                     "-y",
+                    "-hide_banner",
                     "-loglevel",
                     "error",
+                    "-nostats",
                     "-f",
                     "concat",
                     "-safe",
@@ -326,6 +362,10 @@ class RecordFunction:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"ffmpeg failed while stitching recording: {result.returncode}")
+            print(
+                f"Stitched recording {recording_id} from {len(segments)} segments "
+                f"in {self._clock() - stitch_started_at:.2f}s"
+            )
         finally:
             concat_path.unlink(missing_ok=True)
 

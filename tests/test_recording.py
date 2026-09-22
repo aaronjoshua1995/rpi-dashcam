@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,6 +70,42 @@ class RecordingTests(unittest.TestCase):
                     "file '" + str(staging / "video_004.mp4") + "'\n"
                     "file '" + str(staging / "video_005.mp4") + "'\n"
                     "file '" + str(staging / "video_006.mp4") + "'\n"
+                ],
+            )
+
+    def test_stitch_stops_at_the_given_boundary_fragment(self):
+        """Verify a boundary excludes fragments opened after a forced split."""
+        with tempfile.TemporaryDirectory() as staging_directory, tempfile.TemporaryDirectory() as recordings_directory:
+            staging = Path(staging_directory)
+            recordings = Path(recordings_directory)
+            for number in range(1, 7):
+                (staging / f"video_{number:03d}.mp4").write_bytes(str(number).encode())
+
+            concat_contents = []
+
+            def run_ffmpeg(command, **_kwargs):
+                """Capture the generated concat list instead of invoking FFmpeg."""
+                concat_contents.append(
+                    Path(command[command.index("-i") + 1]).read_text(encoding="utf-8")
+                )
+                return SimpleNamespace(returncode=0)
+
+            recorder = RecordFunction(
+                recordings_directory=recordings,
+                staging_directory=staging,
+                command_runner=run_ffmpeg,
+            )
+            with patch("backend.record.shutil.which", return_value="ffmpeg"):
+                getattr(recorder, "_stitch_session")(staging, "recording-1", boundary_fragment_number=5)
+
+            self.assertEqual(
+                concat_contents,
+                [
+                    "file '" + str(staging / "video_001.mp4") + "'\n"
+                    "file '" + str(staging / "video_002.mp4") + "'\n"
+                    "file '" + str(staging / "video_003.mp4") + "'\n"
+                    "file '" + str(staging / "video_004.mp4") + "'\n"
+                    "file '" + str(staging / "video_005.mp4") + "'\n"
                 ],
             )
 
@@ -150,6 +187,74 @@ class RecordingTests(unittest.TestCase):
             recorder.rotate()
 
         self.assertEqual(start_mock.call_count, 3)
+
+    def test_rotate_does_not_touch_the_running_pipeline(self):
+        """Verify rotate() only stitches in the background and never restarts the camera."""
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            recorder = RecordFunction()
+            recorder._session_directory = session
+            recorder._recording_id = "recording-1"
+            recorder._started_at = 0.0
+            pipeline = SimpleNamespace()
+            recorder._pipeline = pipeline
+
+            with patch.object(recorder, "start") as start_mock, \
+                    patch.object(recorder, "_finish_pipeline") as finish_mock, \
+                    patch.object(recorder, "_finalize_rotation") as finalize_mock:
+                recorder.rotate()
+                for thread in threading.enumerate():
+                    if thread.name == "recording-stitcher":
+                        thread.join(timeout=1)
+
+            start_mock.assert_not_called()
+            finish_mock.assert_not_called()
+            self.assertIs(recorder._pipeline, pipeline)
+            self.assertEqual(recorder._session_directory, session)
+            self.assertNotEqual(recorder._recording_id, "recording-1")
+            finalize_mock.assert_called_once_with(session, "recording-1", None)
+
+    def test_rotate_forces_an_immediate_split(self):
+        """Verify rotate() asks splitmuxsink to split now instead of waiting for the timer."""
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            recorder = RecordFunction()
+            recorder._session_directory = session
+            recorder._recording_id = "recording-1"
+            recorder._started_at = 0.0
+            recorder._latest_fragment_id = 3
+            recorder._pipeline = SimpleNamespace()
+            splitmuxsink = SimpleNamespace(emit=lambda *_args: None)
+            recorder._splitmuxsink = splitmuxsink
+
+            with patch.object(splitmuxsink, "emit") as emit_mock, \
+                    patch.object(recorder, "_finalize_rotation") as finalize_mock:
+                recorder.rotate()
+                for thread in threading.enumerate():
+                    if thread.name == "recording-stitcher":
+                        thread.join(timeout=1)
+
+            emit_mock.assert_called_once_with("split-now")
+            finalize_mock.assert_called_once_with(session, "recording-1", 3)
+
+    def test_finalize_rotation_stitches_through_the_boundary_after_split(self):
+        """Verify _finalize_rotation waits for the split, then stitches up to the boundary."""
+        recorder = RecordFunction()
+        recorder._latest_fragment_id = 2
+
+        with patch.object(recorder, "_stitch_session") as stitch_mock:
+            getattr(recorder, "_finalize_rotation")(Path("/tmp"), "recording-1", 1)
+
+        stitch_mock.assert_called_once_with(Path("/tmp"), "recording-1", boundary_fragment_number=2)
+
+    def test_finalize_rotation_skips_when_no_fragment_opened_yet(self):
+        """Verify _finalize_rotation does nothing when rotate() precedes the first fragment."""
+        recorder = RecordFunction()
+
+        with patch.object(recorder, "_stitch_session") as stitch_mock:
+            getattr(recorder, "_finalize_rotation")(Path("/tmp"), "recording-1", None)
+
+        stitch_mock.assert_not_called()
 
 
 class RecordScreenTests(unittest.TestCase):
