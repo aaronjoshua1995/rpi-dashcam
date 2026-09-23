@@ -4,6 +4,8 @@ This project is a Python program that turns your Raspberry Pi into a dashcam. It
 
 The hardware mode is intended to run on the Raspberry Pi connected to the bonnet. The desktop emulator can be used on a regular development PC without GPIO or I2C hardware.
 
+This project does not feature any support.
+
 ## Requirements
 
 - Python 3
